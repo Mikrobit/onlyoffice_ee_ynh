@@ -1,0 +1,192 @@
+#!/bin/bash
+
+#=================================================
+# GENERIC START
+#=================================================
+# IMPORT GENERIC HELPERS
+#=================================================
+
+source _common.sh
+source /usr/share/yunohost/helpers
+
+#=================================================
+# LOAD SETTINGS
+#=================================================
+ynh_script_progression --message="Loading installation settings..."
+
+app=$YNH_APP_INSTANCE_NAME
+
+domain=$(ynh_app_setting_get --app=$app --key=domain)
+path_url=$(ynh_app_setting_get --app=$app --key=path)
+is_public=$(ynh_app_setting_get --app=$app --key=is_public)
+db_name=$(ynh_app_setting_get --app=$app --key=db_name)
+db_user=$db_name
+db_pwd=$(ynh_app_setting_get --app=$app --key=db_pwd)
+port=$(ynh_app_setting_get --app=$app --key=port)
+nextclouddomain=$(ynh_app_setting_get --app=$app --key=nextclouddomain)
+
+#=================================================
+# ENSURE DOWNWARD COMPATIBILITY
+#=================================================
+ynh_script_progression --message="Ensuring downward compatibility..."
+
+# Fix is_public as a boolean value
+if [ "$is_public" = "Yes" ]; then
+	ynh_app_setting_set --app=$app --key=is_public --value=1
+	is_public=1
+elif [ "$is_public" = "No" ]; then
+	ynh_app_setting_set --app=$app --key=is_public --value=0
+	is_public=0
+fi
+
+# If db_name doesn't exist, create it
+if [ -z "$db_name" ]; then
+	db_name=$(ynh_sanitize_dbid --db_name=$app)
+	ynh_app_setting_set --app=$app --key=db_name --value=$db_name
+fi
+
+# If final_path doesn't exist, create it
+if [ -z "$final_path" ]; then
+	final_path=/var/www/$app
+	ynh_app_setting_set --app=$app --key=final_path --value=$final_path
+fi
+
+ynh_secure_remove --file="/etc/apt/sources.list.d/onlyoffice.list"
+ynh_secure_remove --file="/etc/apt/sources.list.d/nodesource.list"
+
+#=================================================
+# BACKUP BEFORE UPGRADE THEN ACTIVE TRAP
+#=================================================
+ynh_script_progression --message="Backing up OnlyOffice before upgrading (may take a while)..."
+
+# Backup the current version of the app
+ynh_backup_before_upgrade
+ynh_clean_setup () {
+	# restore it if the upgrade fails
+	ynh_restore_upgradebackup
+}
+# Exit if an error occurs during the execution of the script
+ynh_abort_if_errors
+
+#=================================================
+# CHECK THE PATH
+#=================================================
+
+# Normalize the URL path syntax
+
+path_url=$(ynh_normalize_url_path --path_url=$path_url)
+
+#=================================================
+# STANDARD UPGRADE STEPS
+#=================================================
+# NGINX CONFIGURATION
+#=================================================
+ynh_script_progression --message="Configuring NGINX web server..."
+
+if [ "$path_url" = "/" ]; then
+   ynh_replace_string --match_string="__SUB_PATH__" --replace_string="" --target_file="../conf/nginx.conf"
+else
+  ynh_replace_string --match_string="__SUB_PATH__" --replace_string="$path_url" --target_file="../conf/nginx.conf"
+fi
+
+# Create a dedicated nginx config
+ynh_add_nginx_config "nextclouddomain"
+
+#=================================================
+# UPGRADE DEPENDENCIES
+#=================================================
+ynh_script_progression --message="Upgrading dependencies..."
+
+ynh_install_app_dependencies $pkg_dependencies
+
+#=================================================
+# CREATE DEDICATED USER
+#=================================================
+ynh_script_progression --message="Making sure dedicated system user exists..."
+
+# Create a dedicated user (if not existing)
+ynh_system_user_create --username=$app
+
+#=================================================
+# SPECIFIC UPGRADE
+#=================================================
+# ADD ONLYOFFICE REPOSITORY
+#=================================================
+ynh_script_progression --message="Add OnlyOffice repository..."
+
+apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys CB2DE8E5
+ynh_install_extra_repo --repo="deb http://download.onlyoffice.com/repo/debian squeeze main" --append
+
+#=================================================
+# CONFIGURE ONLYOFFICE
+#=================================================
+ynh_script_progression --message="Configuring OnlyOffice..."
+
+ynh_backup_if_checksum_is_different --file="/etc/onlyoffice/documentserver/default.json"
+echo onlyoffice-documentserver-ee onlyoffice/ds-port select $port | debconf-set-selections
+echo onlyoffice-documentserver-ee onlyoffice/db-host string 127.0.0.1 | debconf-set-selections
+echo onlyoffice-documentserver-ee onlyoffice/db-user string $db_user | debconf-set-selections
+echo onlyoffice-documentserver-ee onlyoffice/db-pwd password $db_pwd | debconf-set-selections
+echo onlyoffice-documentserver-ee onlyoffice/db-name string $db_name | debconf-set-selections
+
+#=================================================
+# UPGRADE ONLYOFFICE
+#=================================================
+ynh_script_progression --message="Upgrading OnlyOffice..."
+
+ynh_add_app_dependencies --package="onlyoffice-documentserver-ee"
+
+#=================================================
+# MODIFY A CONFIG FILE
+#=================================================
+ynh_script_progression --message="Modifying a config file..."
+
+ynh_backup_if_checksum_is_different --file="/etc/onlyoffice/documentserver/default.json"
+
+ynh_replace_string --match_string="\"rejectUnauthorized\": true" --replace_string="\"rejectUnauthorized\": false" --target_file="/etc/onlyoffice/documentserver/default.json"
+
+# Recalculate and store the checksum of the file for the next upgrade.
+ynh_store_file_checksum --file="/etc/onlyoffice/documentserver/default.json"
+
+#=================================================
+# REGENERATE FONTS
+#=================================================
+ynh_script_progression --message="Generating fonts..."
+
+/usr/bin/documentserver-generate-allfonts.sh
+
+#=================================================
+# GENERIC FINALIZATION
+#=================================================
+# SETUP SSOWAT
+#=================================================
+ynh_script_progression --message="Upgrading SSOwat configuration..."
+
+# Make app public if necessary
+if [ $is_public -eq 1 ]
+then
+	# unprotected_uris allows SSO credentials to be passed anyway
+	ynh_app_setting_set --app=$app --key=unprotected_uris --value="/"
+fi
+
+#=================================================
+# RELOAD ONLYOFFICE
+#=================================================
+ynh_script_progression --message="Reloading OnlyOffice..."
+
+supervisorctl reload
+
+sleep 30
+
+#=================================================
+# RELOAD NGINX
+#=================================================
+ynh_script_progression --message="Reloading NGINX web server..."
+
+ynh_systemd_action --service_name=nginx --action=reload
+
+#=================================================
+# END OF SCRIPT
+#=================================================
+
+ynh_script_progression --message="Upgrade of OnlyOffice completed"
